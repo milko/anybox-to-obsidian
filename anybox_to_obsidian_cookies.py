@@ -1,19 +1,41 @@
 #!/usr/bin/env python3
 """
 anybox_to_obsidian_cookies.py
-============================
-Converts an AnyBox JSON export into Obsidian-ready Markdown notes.
+=============================
 
-Features:
+Convert an AnyBox JSON export into Obsidian-ready Markdown notes.
+
+Main features
+-------------
 	- Parallel HTTP fetching (configurable workers)
-	- Cookie support (medium.com_cookies.txt)
-	- Multiple extraction backends (trafilatura, readability, BeautifulSoup)
-	- Obsidian-compliant tags
-	- AnyBox folder structure preservation
-	- Live progress counter
-	- CSV log of every processed item
-	- Rejections CSV for Fallback items (with Tags column)
-	- CLI flags: --input, --output, --start, --limit, --workers, --skip-existing
+	- Cookie support for paywalled sites (e.g. Medium)
+	- Multiple extraction backends:
+		1. trafilatura (precision mode)
+		2. trafilatura (recall mode)
+		3. readability-lxml
+		4. BeautifulSoup crude fallback renderer
+	- Preserves AnyBox folder structure under OUTPUT_ROOT
+	- Writes Markdown files with Obsidian-compatible frontmatter
+	- Creates a full CSV log of every processed item
+	- Creates a separate rejection CSV for fallback/failed items
+	- Each progress line is printed on a new line so you can scroll
+	  back and compare rejection counts across chunks
+	- Supports chunked imports via --start and --limit
+
+Frontmatter behavior
+--------------------
+	Tags are intentionally omitted from generated notes.
+	An LLM will be used to assign tags after import.
+
+Dependencies
+------------
+	pip install requests beautifulsoup4 trafilatura readability-lxml
+
+Usage
+-----
+	python anybox_to_obsidian_cookies.py
+	python anybox_to_obsidian_cookies.py --start 0 --limit 100 --workers 4
+	python anybox_to_obsidian_cookies.py --start 100 --limit 100 --skip-existing
 """
 
 import os
@@ -33,36 +55,49 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ─── Optional dependencies ────────────────────────────────────────────────────
-# These libraries improve extraction quality but the script degrades gracefully
-# if they are not installed. Install with:
-#   pip install trafilatura readability-lxml
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional dependencies
+# The script degrades gracefully if these are not installed,
+# but extraction quality will be lower.
+# ──────────────────────────────────────────────────────────────────────────────
 
 try:
 	import trafilatura
-	import trafilatura.metadata
 	HAS_TRAFILATURA = True
 except ImportError:
 	HAS_TRAFILATURA = False
-	print("⚠️  trafilatura not installed.")
+	print("⚠️  trafilatura not installed — pip install trafilatura")
 
 try:
 	from readability import Document
 	HAS_READABILITY = True
 except ImportError:
 	HAS_READABILITY = False
-	print("⚠️  readability-lxml not installed.")
+	print("⚠️  readability-lxml not installed — pip install readability-lxml")
 
 
-# ─── Configuration ────────────────────────────────────────────────────────────
-# Edit these defaults to match your local setup.
-# They can also be overridden at runtime via CLI arguments.
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# Edit these defaults. Most can also be overridden via CLI arguments.
+# ══════════════════════════════════════════════════════════════════════════════
 
-INPUT_JSON      = "./data/AnyBoxExport.json"   # Path to your AnyBox JSON export
-OUTPUT_ROOT     = "./staging"                   # Where Markdown notes will be written
-COOKIE_FILE     = "./medium.com_cookies.txt"    # Netscape or JSON cookie file (optional)
-MAX_WORKERS     = 4                             # Parallel download threads
-REQUEST_TIMEOUT = 20                            # Seconds before a request is abandoned
+# Path to your AnyBox JSON export file
+INPUT_JSON = "./data/AnyBoxExport.json"
+
+# Root folder where Markdown notes will be written
+OUTPUT_ROOT = "./staging"
+
+# Path to your cookie file (Netscape .txt or JSON export)
+# If the file does not exist the script runs without cookies.
+COOKIE_FILE = "./medium.com_cookies.txt"
+
+# Number of parallel download workers
+# 4 is safe; increase to 8 if you see few errors
+MAX_WORKERS = 4
+
+# HTTP request timeout in seconds
+REQUEST_TIMEOUT = 20
 
 # Browser-like headers to reduce bot detection
 BASE_HEADERS = {
@@ -77,57 +112,54 @@ BASE_HEADERS = {
 	"Pragma": "no-cache",
 }
 
-# ─── Thread-safety globals ────────────────────────────────────────────────────
-# Each worker thread gets its own HTTP session via THREAD_LOCAL.
-# LOADED_COOKIE_JAR is shared read-only across all threads after startup.
-
-THREAD_LOCAL      = threading.local()
-LOADED_COOKIE_JAR = None
-EXTRACT_LOCK      = threading.Lock()   # Serialises trafilatura/readability calls
-PRINT_LOCK        = threading.Lock()   # Prevents garbled console output
-
-# ─── HTML tag classification ──────────────────────────────────────────────────
-# IGNORE_TAGS: stripped entirely during custom HTML→Markdown rendering
-# BLOCK_TAGS:  treated as block-level elements (newlines around them)
-
+# HTML tags whose content is always discarded during crude extraction
 IGNORE_TAGS = {
 	"script", "style", "noscript", "nav", "footer", "header", "aside",
 	"form", "button", "input", "select", "option", "textarea",
 	"svg", "canvas",
 }
 
-BLOCK_TAGS = {
-	"article", "section", "main", "div", "p", "figure", "figcaption",
-	"details", "summary", "h1", "h2", "h3", "h4", "h5", "h6",
-	"pre", "blockquote", "ul", "ol", "li", "table",
-	"thead", "tbody", "tfoot", "tr", "td", "th", "hr",
-}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THREAD-LOCAL GLOBALS
+# Each worker thread gets its own requests.Session so sessions are not shared.
+# ══════════════════════════════════════════════════════════════════════════════
+
+THREAD_LOCAL = threading.local()   # per-thread storage
+LOADED_COOKIE_JAR = None           # populated once at startup if cookie file exists
+EXTRACT_LOCK = threading.Lock()    # serialises trafilatura/readability calls
+PRINT_LOCK = threading.Lock()      # prevents garbled terminal output
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — HTTP SESSION & COOKIES
+# SECTION 1 — HTTP SESSION AND COOKIE LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_session():
-	"""Create a requests.Session with automatic retries on transient errors."""
+	"""
+	Create a requests.Session with:
+	  - browser-like headers
+	  - automatic retries on server errors and rate-limit responses
+	"""
 	s = requests.Session()
 	retry = Retry(
-		total=2,                                    # Retry up to 2 times
-		backoff_factor=1,                           # Wait 1s, 2s between retries
-		status_forcelist=[429, 500, 502, 503, 504], # Retry on these HTTP codes
+		total=2,
+		backoff_factor=1,
+		status_forcelist=[429, 500, 502, 503, 504],
 	)
 	s.mount("https://", HTTPAdapter(max_retries=retry))
-	s.mount("http://",  HTTPAdapter(max_retries=retry))
+	s.mount("http://", HTTPAdapter(max_retries=retry))
 	s.headers.update(BASE_HEADERS)
 	return s
 
 
 def get_session():
 	"""
-	Return the HTTP session for the current thread.
-	Creates a new session on first call per thread and injects cookies if available.
+	Return the requests.Session for the current thread.
+	Creates one on first call and injects cookies if available.
 	"""
 	global LOADED_COOKIE_JAR
+
 	session = getattr(THREAD_LOCAL, "session", None)
 	if session is None:
 		session = build_session()
@@ -139,53 +171,64 @@ def get_session():
 
 def load_cookie_jar(cookie_path):
 	"""
-	Load cookies from a Netscape .txt/.cookies file or a JSON export.
-	Returns a requests.cookies.RequestsCookieJar ready to inject into sessions.
+	Load cookies from a file into a RequestsCookieJar.
 
 	Supported formats:
-	  - Netscape format (.txt or .cookies): exported by browser extensions
-	    such as "Get cookies.txt LOCALLY"
-	  - JSON format (.json): exported by extensions such as "Cookie-Editor"
-	    (either a list of cookie objects or {"cookies": [...]} wrapper)
+	  - Netscape / Mozilla cookies.txt  (extension .txt or .cookies)
+	  - JSON cookie export              (extension .json)
+
+	JSON format can be either:
+	  - A list of cookie objects
+	  - A dict with a "cookies" key containing a list
+
+	Each cookie object must have at least "name" and "value".
+	Optional keys: "domain", "path", "secure".
 	"""
 	if not os.path.exists(cookie_path):
 		raise FileNotFoundError(f"Cookie file not found: {cookie_path}")
 
-	jar   = requests.cookies.RequestsCookieJar()
+	jar = requests.cookies.RequestsCookieJar()
 	lower = cookie_path.lower()
 
-	# ── Netscape / Mozilla format ─────────────────────────────────────────
+	# ── Netscape / Mozilla format ──────────────────────────────────────────
 	if lower.endswith(".txt") or lower.endswith(".cookies"):
 		moz = MozillaCookieJar(cookie_path)
 		moz.load(ignore_discard=True, ignore_expires=True)
 		for cookie in moz:
 			jar.set(
-				cookie.name, cookie.value,
-				domain=cookie.domain, path=cookie.path, secure=cookie.secure,
+				cookie.name,
+				cookie.value,
+				domain=cookie.domain,
+				path=cookie.path,
+				secure=cookie.secure,
 			)
 		return jar
 
-	# ── JSON format ───────────────────────────────────────────────────────
+	# ── JSON format ────────────────────────────────────────────────────────
 	if lower.endswith(".json"):
 		with open(cookie_path, "r", encoding="utf-8") as f:
 			data = json.load(f)
-		# Normalise to a flat list of cookie dicts
+
+		# Normalise to a flat list
 		if isinstance(data, dict):
 			if "cookies" in data and isinstance(data["cookies"], list):
 				data = data["cookies"]
 			else:
 				data = [data]
+
 		if not isinstance(data, list):
 			raise ValueError("Unsupported JSON cookie format")
+
 		for item in data:
 			if not isinstance(item, dict):
 				continue
-			name  = item.get("name")
+			name = item.get("name")
 			value = item.get("value")
 			if not name or value is None:
 				continue
 			jar.set(
-				name, value,
+				name,
+				value,
 				domain=item.get("domain", ""),
 				path=item.get("path", "/"),
 				secure=bool(item.get("secure", False)),
@@ -196,28 +239,29 @@ def load_cookie_jar(cookie_path):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — UTILITY HELPERS
+# SECTION 2 — SMALL UTILITY HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def yaml_quote(value):
 	"""
-	Wrap a value in double quotes for safe YAML frontmatter embedding.
+	Wrap a value in double quotes for safe YAML frontmatter output.
 	Escapes backslashes, double quotes, and newlines.
 	"""
 	if value is None:
 		value = ""
 	value = str(value)
 	value = value.replace("\\", "\\\\")
-	value = value.replace('"',  '\\"')
+	value = value.replace('"', '\\"')
 	value = value.replace("\n", " ")
 	return f'"{value}"'
 
 
 def slugify(text):
 	"""
-	Convert a title into a safe filename, preserving original case.
-	Strips characters that are illegal on macOS/Windows/Linux filesystems
-	and collapses whitespace. Truncates to 200 characters.
+	Convert a title into a filesystem-safe filename.
+	Preserves original case (no .lower()).
+	Strips characters that are illegal on macOS / Windows.
+	Truncates to 200 characters.
 	"""
 	if not text:
 		return "untitled"
@@ -228,7 +272,7 @@ def slugify(text):
 
 def parse_date(raw):
 	"""
-	Parse an ISO-8601 date string (as stored by AnyBox) into YYYY-MM-DD.
+	Convert an ISO 8601 date string to YYYY-MM-DD.
 	Falls back to today's date if parsing fails.
 	"""
 	try:
@@ -240,8 +284,8 @@ def parse_date(raw):
 
 def sanitize_html(html):
 	"""
-	Strip null bytes and other control characters that cause BeautifulSoup
-	or trafilatura to raise ValueError during parsing.
+	Strip null bytes and other control characters that can break
+	HTML parsers or cause ValueError in BeautifulSoup.
 	"""
 	html = html.replace("\x00", "")
 	html = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]", "", html)
@@ -250,8 +294,8 @@ def sanitize_html(html):
 
 def clean_path_part(text):
 	"""
-	Sanitize a single folder-name component for use in os.path.join().
-	Removes filesystem-illegal characters and falls back to 'Imported'.
+	Sanitize a single folder-name component.
+	Removes filesystem-illegal characters and falls back to "Imported".
 	"""
 	text = str(text).strip()
 	text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", text)
@@ -260,52 +304,42 @@ def clean_path_part(text):
 
 def normalize_folder(folder_value):
 	"""
-	Normalise the 'folder' field from an AnyBox item.
-	AnyBox can store folders as a string, a list of path components, or None.
-	Returns a single OS path string suitable for os.path.join(output_root, ...).
+	AnyBox stores folder as one of:
+	  - None / missing
+	  - a plain string  e.g. "Tutorials"
+	  - a list          e.g. ["Software", "Tutorials"]
+
+	This function normalises all three cases into a valid relative path
+	that can be passed to os.path.join().
+
+	Examples:
+	  None                     -> "Imported"
+	  "Tutorials"              -> "Tutorials"
+	  ["Software","Tutorials"] -> "Software/Tutorials"
 	"""
 	if not folder_value:
 		return "Imported"
+
 	if isinstance(folder_value, str):
 		return clean_path_part(folder_value)
+
 	if isinstance(folder_value, list):
-		# Each element is one level of the folder hierarchy
 		parts = [clean_path_part(p) for p in folder_value if str(p).strip()]
 		return os.path.join(*parts) if parts else "Imported"
+
+	# Unexpected type — convert to string and sanitize
 	return clean_path_part(folder_value)
 
 
-def extract_obsidian_tags(raw_anybox_tags):
-	"""
-	Convert AnyBox tag paths into Obsidian-compatible tag strings.
-
-	AnyBox stores tags as nested lists, e.g.:
-	  [["Technology", "AI"], ["Reading"]]
-	We take only the leaf (last element) of each path and replace spaces
-	with hyphens so Obsidian treats them as single tokens.
-	Duplicates (case-insensitive) are removed.
-	"""
-	if not raw_anybox_tags or not isinstance(raw_anybox_tags, list):
-		return []
-	processed_tags = []
-	seen = set()
-	for tag_path in raw_anybox_tags:
-		if isinstance(tag_path, list) and tag_path:
-			tag_label = str(tag_path[-1]).strip()
-			if tag_label:
-				sanitized = tag_label.replace(" ", "-")
-				if sanitized.lower() not in seen:
-					seen.add(sanitized.lower())
-					processed_tags.append(sanitized)
-	return processed_tags
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — URL & DOMAIN HELPERS
+# SECTION 3 — URL AND DOMAIN HELPERS
+# (Tag helpers removed — tags are no longer used)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_medium_url(url):
-	"""Return True if the URL belongs to medium.com or a Medium custom domain."""
+	"""
+	Return True if the URL belongs to medium.com or a Medium custom domain.
+	"""
 	try:
 		host = urlparse(url).netloc.lower()
 		return host.endswith("medium.com")
@@ -315,87 +349,114 @@ def is_medium_url(url):
 
 def normalize_author(author):
 	"""
-	Clean up an author string.
-	Medium often returns a profile URL instead of a name; this function
-	extracts a readable username from common Medium URL patterns.
-	Also strips email addresses and stray punctuation from plain-text authors.
+	Clean up author strings.
+
+	Medium (when accessed without cookies) sometimes returns the author's
+	profile URL instead of their display name. This function tries to
+	extract a readable name from the URL, or returns an empty string
+	if nothing useful can be found.
 	"""
 	if not author:
 		return ""
+
 	author = str(author).strip()
 
-	# Handle URL-style authors (common on Medium)
+	# If it looks like a URL, try to extract a username
 	if author.startswith("http://") or author.startswith("https://"):
 		parsed = urlparse(author)
-		host   = parsed.netloc
-		path   = parsed.path
-		# Subdomain-style: username.medium.com
+		host = parsed.netloc
+		path = parsed.path
+
+		# Medium subdomain: username.medium.com
 		if host.endswith(".medium.com"):
 			username = host.split(".medium.com")[0]
 			if username and username not in ("www", ""):
 				return username
-		# Path-style: medium.com/@username
+
+		# Medium path: /@username
 		path_match = re.match(r"^/@([^/]+)", path)
 		if path_match:
 			return path_match.group(1)
-		# Generic: last path segment that isn't a hex ID
+
+		# Last path segment (skip hex IDs)
 		parts = [p for p in path.split("/") if p]
 		if parts:
 			candidate = parts[-1]
 			if not re.fullmatch(r"[a-f0-9]{8,}", candidate):
 				return candidate
+
 		return ""
 
-	# Plain-text author: strip emails and stray punctuation
-	author = re.sub(r"\S+@\S+\.\S+", "", author)
+	# Plain text cleanup
+	author = re.sub(r"\S+@\S+\.\S+", "", author)   # remove email addresses
 	author = author.strip(".,;:-–—|")
 	author = re.sub(r"\s+", " ", author).strip()
 	return author
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — METADATA EXTRACTION
+# SECTION 4 — METADATA EXTRACTION FROM HTML
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_lead_image(soup, base_url):
 	"""
 	Find the best representative image for the article.
-	Priority: og:image → twitter:image → first <img> inside article/main → any <img>.
-	Returns an absolute URL or empty string.
+
+	Priority order:
+	  1. og:image meta tag
+	  2. twitter:image meta tag
+	  3. First <img> inside article / main / known content containers
+	  4. First <img> anywhere on the page
+
+	Returns an absolute URL string, or empty string if none found.
 	"""
 	og = soup.find("meta", property="og:image")
 	if og and og.get("content"):
 		return urljoin(base_url, og["content"])
+
 	tw = soup.find("meta", attrs={"name": "twitter:image"})
 	if tw and tw.get("content"):
 		return urljoin(base_url, tw["content"])
-	# Look inside common article containers before falling back to any image
+
 	for selector in ["article", "main", ".post-content", ".entry-content"]:
 		container = soup.select_one(selector)
 		if container:
 			img = container.find("img", src=True)
-			if img: return urljoin(base_url, img["src"])
+			if img:
+				return urljoin(base_url, img["src"])
+
 	img = soup.find("img", src=True)
 	return urljoin(base_url, img["src"]) if img else ""
 
 
 def extract_author_published(soup):
 	"""
-	Extract author name and publication date from HTML meta tags.
-	Tries multiple common meta tag conventions in priority order.
-	Returns (author_str, published_date_str) — either may be empty.
-	"""
-	author, published = "", ""
+	Extract author name and publication date from common meta tags.
 
-	# Author: try Open Graph, then standard <meta name="author">
-	for attr, val in [("property", "article:author"), ("name", "author"), ("property", "og:article:author")]:
+	Returns: (author_str, published_str)
+	  - author_str   : plain name or empty string
+	  - published_str: YYYY-MM-DD or empty string
+	"""
+	author = ""
+	published = ""
+
+	# Try common author meta tags in priority order
+	for attr, val in [
+		("property", "article:author"),
+		("name", "author"),
+		("property", "og:article:author"),
+	]:
 		tag = soup.find("meta", attrs={attr: val})
 		if tag and tag.get("content"):
 			author = tag["content"].strip()
 			break
 
-	# Published date: try article:published_time, pubdate, then schema.org itemprop
-	for attr, val in [("property", "article:published_time"), ("name", "pubdate"), ("itemprop", "datePublished")]:
+	# Try common publication date meta tags in priority order
+	for attr, val in [
+		("property", "article:published_time"),
+		("name", "pubdate"),
+		("itemprop", "datePublished"),
+	]:
 		tag = soup.find("meta", attrs={attr: val})
 		if tag and tag.get("content"):
 			raw = tag["content"].strip()
@@ -403,166 +464,241 @@ def extract_author_published(soup):
 				dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
 				published = dt.strftime("%Y-%m-%d")
 			except Exception:
-				published = raw[:10]   # Best-effort: take the date portion
+				published = raw[:10]   # best-effort: take first 10 chars
 			break
 
 	return normalize_author(author), published
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — MEDIUM PAYWALL DETECTION
+# SECTION 5 — MEDIUM PAYWALL / PREVIEW DETECTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def looks_like_medium_preview(url, content):
 	"""
-	Detect whether extracted content is just a Medium paywall preview.
-	Checks for known paywall marker phrases AND a low word count (< 700 words),
-	since a full article would be much longer even if it mentions membership.
-	Returns True if the content looks like a truncated preview.
+	Detect whether extracted content is just a Medium paywall teaser.
+
+	Without valid session cookies, Medium returns a short preview followed
+	by a sign-up prompt. This function catches that case so the item is
+	logged as "medium_paywalled_preview" (Fallback) rather than "Success".
+
+	Heuristic: content contains a known paywall marker AND is very short
+	(fewer than 700 words).
 	"""
 	if not is_medium_url(url) or not content:
 		return False
+
 	text = re.sub(r"\s+", " ", content[:12000]).lower()
 	markers = [
 		"continue reading with membership",
 		"sign up to read this story",
 		"member-only story",
 	]
+
 	return any(m in text for m in markers) and len(re.findall(r"\w+", text)) < 700
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — CUSTOM HTML → MARKDOWN RENDERER
+# SECTION 6 — CRUDE HTML → MARKDOWN FALLBACK RENDERER
+# This is used when trafilatura and readability both fail or are not installed.
+# It is intentionally simple and handles only the most common HTML structures.
 # ══════════════════════════════════════════════════════════════════════════════
-# Used as a fallback when trafilatura and readability are unavailable or
-# produce no output. Walks the BeautifulSoup tree and emits Markdown.
 
 def clean_inline_text(text):
-	"""Normalise whitespace in inline text nodes."""
-	if not text: return ""
-	text = text.replace("\xa0", " ")           # Non-breaking space → regular space
-	text = re.sub(r"[ \t\r\f\v]+", " ", text)  # Collapse horizontal whitespace
+	"""Normalise whitespace in a plain-text string."""
+	if not text:
+		return ""
+	text = text.replace("\xa0", " ")                    # non-breaking space
+	text = re.sub(r"[ \t\r\f\v]+", " ", text)
 	return text.strip()
 
+
 def render_inlines(node):
-	"""Render a single inline node (text, link, bold, italic, code) to Markdown."""
-	if isinstance(node, NavigableString): return str(node)
-	if not isinstance(node, Tag): return ""
+	"""
+	Render a single HTML node as inline Markdown.
+	Handles: text nodes, <br>, <code>, <a>, <strong>, <b>, <em>, <i>.
+	"""
+	if isinstance(node, NavigableString):
+		return str(node)
+
+	if not isinstance(node, Tag):
+		return ""
+
 	name = node.name.lower()
-	if name in IGNORE_TAGS: return ""
-	if name == "br": return "\n"
+
+	if name in IGNORE_TAGS:
+		return ""
+
+	if name == "br":
+		return "\n"
+
 	if name == "code":
 		return f"`{clean_inline_text(node.get_text())}`"
+
 	if name == "a":
 		href = node.get("href", "").strip()
-		txt  = clean_inline_text(node.get_text())
+		txt = clean_inline_text(node.get_text())
 		return f"[{txt}]({href})" if href else txt
-	if name in {"strong", "b"}: return f"**{render_inlines_recursive(node)}**"
-	if name in {"em", "i"}:     return f"*{render_inlines_recursive(node)}*"
+
+	if name in {"strong", "b"}:
+		return f"**{render_inlines_recursive(node)}**"
+
+	if name in {"em", "i"}:
+		return f"*{render_inlines_recursive(node)}*"
+
 	return render_inlines_recursive(node)
 
+
 def render_inlines_recursive(node):
-	"""Concatenate inline rendering of all children of a node."""
+	"""Render all inline children of a node and concatenate the results."""
 	return "".join(render_inlines(c) for c in node.children)
+
 
 def render_block(node):
 	"""
-	Render a block-level HTML element to Markdown.
-	Handles headings, paragraphs, code blocks, lists, and generic containers.
+	Render a block-level HTML node as Markdown.
+	Handles: headings, paragraphs, pre/code, lists, blockquotes,
+	and generic containers (div, section, article, etc.).
 	"""
-	if not node or not isinstance(node, Tag): return ""
+	if not node or not isinstance(node, Tag):
+		return ""
+
 	name = node.name.lower()
-	if name in IGNORE_TAGS: return ""
+
+	if name in IGNORE_TAGS:
+		return ""
+
 	if name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-		return f"{'#' * int(name[1])} {clean_inline_text(node.get_text())}\n\n"
+		level = int(name[1])
+		return f"{'#' * level} {clean_inline_text(node.get_text())}\n\n"
+
 	if name == "p":
 		return f"{clean_inline_text(render_inlines_recursive(node))}\n\n"
+
 	if name == "pre":
 		return f"```\n{node.get_text().strip()}\n```\n\n"
+
 	if name in {"ul", "ol"}:
-		items = [f"- {clean_inline_text(li.get_text())}" for li in node.find_all("li", recursive=False)]
+		items = []
+		for li in node.find_all("li", recursive=False):
+			items.append(f"- {clean_inline_text(li.get_text())}")
 		return "\n".join(items) + "\n\n"
+
+	if name == "blockquote":
+		lines = clean_inline_text(node.get_text()).splitlines()
+		return "\n".join(f"> {line}" for line in lines if line.strip()) + "\n\n"
+
 	# Generic container: recurse into children
-	return "".join(render_block(c) if isinstance(c, Tag) else "" for c in node.children)
+	return "".join(
+		render_block(c) if isinstance(c, Tag) else ""
+		for c in node.children
+	)
+
 
 def render_container(container):
-	"""Render all block children of a container element."""
-	return "".join(render_block(c) if isinstance(c, Tag) else "" for c in container.children)
+	"""Render all top-level children of a container node."""
+	return "".join(
+		render_block(c) if isinstance(c, Tag) else ""
+		for c in container.children
+	)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — FETCH & EXTRACT
+# SECTION 7 — FETCH AND EXTRACT ARTICLE CONTENT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_and_extract(url):
 	"""
-	Download a URL and extract its main article content as Markdown.
+	Download a page and attempt to extract its main article content.
 
-	Extraction pipeline (in order of preference):
-	  1. trafilatura with favor_precision=True  → best for clean articles
-	  2. trafilatura with favor_precision=False → higher recall, more noise
-	  3. readability-lxml                       → good for news sites
-	  4. BeautifulSoup custom renderer          → last-resort fallback
+	Extraction strategy (tried in order, longest result wins):
+	  1. trafilatura — precision mode  (fewest false positives)
+	  2. trafilatura — recall mode     (more content, may include noise)
+	  3. readability-lxml              (Mozilla Readability port)
+	  4. BeautifulSoup crude renderer  (last resort)
 
-	The candidate with the most text is chosen as the winner.
-	If the result looks like a Medium paywall preview, it is rejected.
+	After extraction, Medium paywall previews are detected and rejected.
 
 	Returns:
-	  (content_str | None, status_str, meta_dict)
-	  meta_dict keys: author, published, lead_image
+	  (content, status, meta)
+	  - content : Markdown string, or None if extraction failed
+	  - status  : short label describing what happened
+	  - meta    : dict with keys author, published, lead_image
 	"""
 	session = get_session()
+
 	try:
 		resp = session.get(url, timeout=REQUEST_TIMEOUT)
+
 		if resp.status_code != 200:
 			return None, f"HTTP {resp.status_code}", {}
 
 		html = sanitize_html(resp.text)
 		soup = BeautifulSoup(html, "html.parser")
 
-		# Extract metadata from HTML meta tags
-		lead_image        = extract_lead_image(soup, resp.url)
+		# Extract metadata from the page regardless of content extraction result
+		lead_image = extract_lead_image(soup, resp.url)
 		author, published = extract_author_published(soup)
-		meta = {"author": author, "published": published, "lead_image": lead_image}
 
-		candidates = []   # List of (status_label, markdown_text) tuples
+		meta = {
+			"author": author,
+			"published": published,
+			"lead_image": lead_image,
+		}
 
-		# ── trafilatura (precision mode) ──────────────────────────────────
+		candidates = []
+
+		# ── 1. trafilatura precision ───────────────────────────────────────
 		if HAS_TRAFILATURA:
 			with EXTRACT_LOCK:
-				md = trafilatura.extract(html, output_format="markdown", include_tables=True, favor_precision=True)
-				if md: candidates.append(("trafilatura:precision", md))
+				md = trafilatura.extract(
+					html,
+					output_format="markdown",
+					include_tables=True,
+					favor_precision=True,
+				)
+			if md:
+				candidates.append(("trafilatura:precision", md))
 
-			# ── trafilatura (recall mode) ─────────────────────────────────
+			# ── 2. trafilatura recall ──────────────────────────────────────
 			with EXTRACT_LOCK:
-				md = trafilatura.extract(html, output_format="markdown", include_tables=True, favor_precision=False)
-				if md: candidates.append(("trafilatura:recall", md))
+				md = trafilatura.extract(
+					html,
+					output_format="markdown",
+					include_tables=True,
+					favor_precision=False,
+				)
+			if md:
+				candidates.append(("trafilatura:recall", md))
 
-		# ── readability-lxml ──────────────────────────────────────────────
+		# ── 3. readability-lxml ────────────────────────────────────────────
 		if HAS_READABILITY:
 			with EXTRACT_LOCK:
 				doc = Document(html)
-				md  = render_container(BeautifulSoup(doc.summary(), "html.parser"))
-				if md: candidates.append(("readability", md))
+				summary_html = doc.summary()
+			md = render_container(BeautifulSoup(summary_html, "html.parser"))
+			if md:
+				candidates.append(("readability", md))
 
-		# ── BeautifulSoup custom renderer (last resort) ───────────────────
+		# ── 4. BeautifulSoup crude fallback ───────────────────────────────
 		main = (
-			soup.find("article") or
-			soup.find("main") or
-			soup.find(id=re.compile(r"content|article|post", re.I))
+			soup.find("article")
+			or soup.find("main")
+			or soup.find(id=re.compile(r"content|article|post", re.I))
 		)
 		if main:
 			md = render_container(main)
-			if md: candidates.append(("beautifulsoup:main_custom_md", md))
+			if md:
+				candidates.append(("beautifulsoup:main_custom_md", md))
 
 		if not candidates:
 			return None, "no_content", meta
 
-		# Pick the candidate with the most text (longest string wins)
+		# Pick the candidate with the most content
 		candidates.sort(key=lambda x: len(x[1]), reverse=True)
 		best_status, best_md = candidates[0]
 
-		# Reject Medium paywall previews even if text was extracted
+		# Reject Medium paywall previews
 		if looks_like_medium_preview(url, best_md):
 			return None, "medium_paywalled_preview", meta
 
@@ -573,23 +709,28 @@ def fetch_and_extract(url):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 8 — NOTE BUILDING & PROCESSING
+# SECTION 8 — FRONTMATTER AND FILE WRITING
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_frontmatter(item, created_date, author, published, lead_image):
 	"""
 	Build the YAML frontmatter block for an Obsidian note.
-	Fields populated from the AnyBox JSON item:
-	  title, source (url), created (dateAdded), description, tags
-	Fields populated from the fetched webpage:
-	  author, published, lead_image
-	Note: the 'tags' list in the frontmatter uses the AnyBox tags,
-	NOT the hardcoded 'clippings' tag — that is added manually after import.
+
+	Fields populated:
+	  - title       : from AnyBox item
+	  - source      : URL from AnyBox item
+	  - author      : extracted from the webpage (empty if not found)
+	  - published   : extracted from the webpage (empty if not found)
+	  - created     : from AnyBox dateAdded, formatted as YYYY-MM-DD
+	  - description : from AnyBox item
+	  - lead_image  : best image found on the page (omitted if none)
+
+	Tags are intentionally omitted — an LLM will assign them after import.
+	All string values are double-quoted for safe YAML output.
 	"""
 	title = item.get("title", "Untitled")
-	url   = item.get("url", "")
-	desc  = item.get("description", "")
-	tags  = extract_obsidian_tags(item.get("tags", []))
+	url = item.get("url", "")
+	desc = item.get("description", "")
 
 	lines = ["---"]
 	lines.append(f"title: {yaml_quote(title)}")
@@ -598,54 +739,56 @@ def build_frontmatter(item, created_date, author, published, lead_image):
 	lines.append(f"published: {yaml_quote(published)}")
 	lines.append(f"created: {created_date}")
 	lines.append(f"description: {yaml_quote(desc)}")
+
 	if lead_image:
 		lines.append(f"lead_image: {yaml_quote(lead_image)}")
-	lines.append("tags:")
-	if tags:
-		for t in tags:
-			lines.append(f"  - {t}")
-	else:
-		lines.append("  []")
+
 	lines.append("---")
+
 	return "\n".join(lines) + "\n\n"
 
 
 def process_item(item, output_root, skip_existing):
 	"""
-	Process a single AnyBox item:
-	  1. Resolve output folder and filename from item metadata
-	  2. Skip if file already exists and --skip-existing is set
+	Process one AnyBox item end-to-end:
+	  1. Resolve output path from folder + title
+	  2. Optionally skip if file already exists
 	  3. Fetch and extract article content
-	  4. Write a full Markdown note on success, or a stub note on failure
+	  4. Write Markdown note (or stub note on failure)
 	  5. Return a result tuple for CSV logging
 
-	Return tuple: (url, result_type, details, filepath, tags_str)
-	  result_type: "Success" | "Fallback" | "Skipped"
-	  tags_str: comma-separated AnyBox tags (used in the rejections CSV)
-	"""
-	url      = item.get("url", "")
-	title    = item.get("title", "Untitled")
-	folder   = normalize_folder(item.get("folder"))
-	created  = parse_date(item.get("dateAdded", ""))
-	tags     = extract_obsidian_tags(item.get("tags", []))
-	tags_str = ", ".join(tags) if tags else ""   # For the CSV log
+	Returns:
+	  (url, result, details, filepath)
 
-	filename   = f"{slugify(title)}.md"
+	  - url      : original URL
+	  - result   : "Success" | "Fallback" | "Skipped" | "Error"
+	  - details  : extraction method or error description
+	  - filepath : path of the written file
+	"""
+	url = item.get("url", "")
+	title = item.get("title", "Untitled")
+	folder = normalize_folder(item.get("folder"))
+	created = parse_date(item.get("dateAdded", ""))
+
+	filename = f"{slugify(title)}.md"
 	target_dir = os.path.join(output_root, folder)
 	os.makedirs(target_dir, exist_ok=True)
-	filepath   = os.path.join(target_dir, filename)
+	filepath = os.path.join(target_dir, filename)
 
-	# Items with no URL cannot be fetched — write nothing, log as Fallback
+	# No URL — write nothing, log as Fallback
 	if not url:
-		return (url, "Fallback", "no_url", filepath, tags_str)
+		return (url, "Fallback", "no_url", filepath)
 
-	# Skip already-processed notes when --skip-existing is active
+	# Skip if file already exists and --skip-existing was passed
 	if skip_existing and os.path.exists(filepath):
-		return (url, "Skipped", "file_exists", filepath, tags_str)
+		return (url, "Skipped", "file_exists", filepath)
 
+	# Fetch and extract
 	content, status, meta = fetch_and_extract(url)
+
 	fm = build_frontmatter(
-		item, created,
+		item,
+		created,
 		meta.get("author", ""),
 		meta.get("published", ""),
 		meta.get("lead_image", ""),
@@ -655,120 +798,144 @@ def process_item(item, output_root, skip_existing):
 		# Full article extracted — write complete note
 		with open(filepath, "w", encoding="utf-8") as f:
 			f.write(fm + content)
-		return (url, "Success", status, filepath, tags_str)
-	else:
-		# Extraction failed — write a stub note with a link to the original
-		stub = (
-			fm +
-			f"> Full article could not be extracted. Status: `{status}`\n\n"
-			f"[Open original article]({url})\n"
-		)
-		with open(filepath, "w", encoding="utf-8") as f:
-			f.write(stub)
-		return (url, "Fallback", status, filepath, tags_str)
+		return (url, "Success", status, filepath)
+
+	# Extraction failed — write a stub note with a link to the original
+	stub = (
+		fm
+		+ f"> Full article could not be extracted. Status: `{status}`\n\n"
+		+ f"[Open original article]({url})\n"
+	)
+	with open(filepath, "w", encoding="utf-8") as f:
+		f.write(stub)
+
+	return (url, "Fallback", status, filepath)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 9 — MAIN
+# SECTION 9 — MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
 	global LOADED_COOKIE_JAR
 
-	# ── CLI arguments ─────────────────────────────────────────────────────
-	# --start and --limit allow chunked processing of large exports.
-	# Example: process items 200–399 with 8 workers, skipping existing notes:
-	#   python anybox_to_obsidian_cookies.py --start 200 --limit 200 --workers 8 --skip-existing
-	parser = argparse.ArgumentParser(description="Convert AnyBox JSON export to Obsidian Markdown notes.")
-	parser.add_argument("--input",         default=INPUT_JSON,   help="Path to AnyBox JSON export")
-	parser.add_argument("--output",        default=OUTPUT_ROOT,  help="Output root directory")
-	parser.add_argument("--start",         type=int, default=0,  help="Start index (0-based)")
-	parser.add_argument("--limit",         type=int, default=0,  help="Max items to process (0 = all)")
-	parser.add_argument("--workers",       type=int, default=MAX_WORKERS, help="Parallel download threads")
-	parser.add_argument("--skip-existing", action="store_true",  help="Skip items whose .md file already exists")
+	# ── CLI arguments ──────────────────────────────────────────────────────
+	parser = argparse.ArgumentParser(
+		description="Convert AnyBox JSON export into Obsidian-ready Markdown notes."
+	)
+	parser.add_argument(
+		"--input", default=INPUT_JSON,
+		help=f"Path to AnyBox JSON export (default: {INPUT_JSON})"
+	)
+	parser.add_argument(
+		"--output", default=OUTPUT_ROOT,
+		help=f"Output root folder (default: {OUTPUT_ROOT})"
+	)
+	parser.add_argument(
+		"--start", type=int, default=0,
+		help="0-based index of first item to process (default: 0)"
+	)
+	parser.add_argument(
+		"--limit", type=int, default=0,
+		help="Number of items to process; 0 means all (default: 0)"
+	)
+	parser.add_argument(
+		"--workers", type=int, default=MAX_WORKERS,
+		help=f"Parallel download workers (default: {MAX_WORKERS})"
+	)
+	parser.add_argument(
+		"--skip-existing", action="store_true",
+		help="Skip items whose output file already exists"
+	)
 	args = parser.parse_args()
 
-	# ── Load cookies ──────────────────────────────────────────────────────
-	# Cookies are optional. If the file is missing the script runs without them.
+	# ── Load cookies ───────────────────────────────────────────────────────
 	if os.path.exists(COOKIE_FILE):
 		try:
 			LOADED_COOKIE_JAR = load_cookie_jar(COOKIE_FILE)
 			print(f"🔐 Loaded cookies from {COOKIE_FILE}")
 		except Exception as e:
 			print(f"⚠️  Cookie error: {e}")
+	else:
+		print(f"ℹ️  No cookie file found at {COOKIE_FILE} — running without cookies")
 
-	# ── Load and slice the AnyBox export ──────────────────────────────────
+	# ── Load AnyBox export ─────────────────────────────────────────────────
 	with open(args.input, "r", encoding="utf-8") as f:
 		data = json.load(f)
 
-	end_index = (args.start + args.limit) if args.limit > 0 else len(data)
-	items     = data[args.start:end_index]
+	total_items = len(data)
+	end_index = (args.start + args.limit) if args.limit > 0 else total_items
+	items = data[args.start:end_index]
 
-	# ── Set up log files ──────────────────────────────────────────────────
-	# Each run gets a timestamped log so previous runs are never overwritten.
-	timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
-	log_file    = os.path.join("logs", f"anybox_import_log_{timestamp}.csv")
-	reject_file = os.path.join("logs", f"anybox_rejections_{timestamp}.csv")
+	# ── Prepare log output folder ──────────────────────────────────────────
+	timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 	os.makedirs("logs", exist_ok=True)
 
-	print(f"🚀 Processing items {args.start}–{args.start + len(items)} of {len(data)}")
-	print(f"   Workers : {args.workers}")
-	print(f"   Output  : {args.output}")
-	print(f"   Log     : {log_file}")
-	print(f"   Rejects : {reject_file}")
+	log_file    = os.path.join("logs", f"anybox_import_log_{timestamp}.csv")
+	reject_file = os.path.join("logs", f"anybox_rejections_{timestamp}.csv")
+
+	print(f"\n🚀 Processing items {args.start}–{args.start + len(items) - 1} of {total_items - 1}")
+	print(f"   Workers       : {args.workers}")
+	print(f"   Output folder : {args.output}")
+	print(f"   Full log      : {log_file}")
+	print(f"   Rejection log : {reject_file}")
 	print()
 
-	# ── Process items in parallel ─────────────────────────────────────────
+	# ── Run parallel processing ────────────────────────────────────────────
 	results = []
-	counts  = {"Success": 0, "Fallback": 0, "Skipped": 0, "Error": 0}
-	total   = len(items)
+	counts = {"Success": 0, "Fallback": 0, "Skipped": 0, "Error": 0}
+	total = len(items)
 
 	with ThreadPoolExecutor(max_workers=args.workers) as executor:
 		futures = {
-			executor.submit(process_item, it, args.output, args.skip_existing): it
-			for it in items
+			executor.submit(process_item, item, args.output, args.skip_existing): item
+			for item in items
 		}
+
 		done = 0
 		for future in as_completed(futures):
-			row = future.result()
+			try:
+				row = future.result()
+			except Exception as e:
+				row = ("", "Error", f"worker_exception:{str(e)[:80]}", "")
+
 			results.append(row)
+
 			result_type = row[1]
-			if result_type in counts:
-				counts[result_type] += 1
-			else:
-				counts["Error"] += 1
+			counts[result_type] = counts.get(result_type, 0) + 1
+
 			done += 1
-			# Update progress line every 10 items (and on the last item)
+
+			# Print a new line every 10 items and at the very end.
+			# Each line is kept so you can scroll back and compare
+			# rejection counts across chunks.
 			if done % 10 == 0 or done == total:
 				with PRINT_LOCK:
 					print(
-						f"\r  [{done:4d}/{total}]  "
+						f"  [{done:4d}/{total}]  "
 						f"✅ {counts['Success']}  "
 						f"📄 {counts['Fallback']}  "
 						f"⏭️  {counts['Skipped']}  "
-						f"❌ {counts['Error']}",
-						end="", flush=True
+						f"❌ {counts['Error']}"
 					)
 
-	print()
-
-	# ── Write full CSV log ────────────────────────────────────────────────
-	# Contains every processed item regardless of outcome.
+	# ── Write full CSV log ─────────────────────────────────────────────────
+	# lineterminator="\n" prevents csv.writer from adding \r on some platforms
 	with open(log_file, "w", newline="", encoding="utf-8") as f:
-		writer = csv.writer(f)
-		writer.writerow(["URL", "Result", "Details", "Filepath", "Tags"])
+		writer = csv.writer(f, lineterminator="\n")
+		writer.writerow(["URL", "Result", "Details", "Filepath"])
 		writer.writerows(results)
 
-	# ── Write rejections CSV ──────────────────────────────────────────────
-	# Contains only Fallback items. The Tags column lets you quickly copy
-	# the correct tags when manually clipping the article in Obsidian.
-	rejections = [r for r in results if r[1] == "Fallback"]
+	# ── Write rejection CSV log ────────────────────────────────────────────
+	# Only Fallback items are written here.
 	with open(reject_file, "w", newline="", encoding="utf-8") as f:
-		writer = csv.writer(f)
-		writer.writerow(["URL", "Result", "Details", "Filepath", "Tags"])
-		writer.writerows(rejections)
+		writer = csv.writer(f, lineterminator="\n")
+		writer.writerow(["URL", "Result", "Details", "Filepath"])
+		for row in results:
+			if row[1] == "Fallback":
+				writer.writerow(row)
 
-	# ── Summary ───────────────────────────────────────────────────────────
+	# ── Final summary ──────────────────────────────────────────────────────
 	print()
 	print("─" * 50)
 	print("✨ Done!")
@@ -776,7 +943,7 @@ def main():
 	print(f"   📄 Fallback : {counts['Fallback']}")
 	print(f"   ⏭️  Skipped  : {counts['Skipped']}")
 	print(f"   ❌ Error    : {counts['Error']}")
-	print(f"   📋 Log      : {log_file}")
+	print(f"   📋 Full log : {log_file}")
 	print(f"   ❗ Rejects  : {reject_file}")
 
 

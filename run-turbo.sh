@@ -19,8 +19,6 @@
 # CONFIGURATION — edit these
 # ─────────────────────────────────────────────────────────────────────────────
 
-INPUT="./data/AnyBoxExport.json"
-OUTPUT="./staging"
 SKIP_EXISTING=true
 
 
@@ -35,12 +33,17 @@ WORKERS="${3:-8}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ACTIVATE PYTHON ENVIRONMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+source "$(dirname "$0")/anybox-obsidian-env/bin/activate"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BUILD THE COMMAND
 # ─────────────────────────────────────────────────────────────────────────────
 
 CMD="python anybox_to_obsidian_cookies.py"
-CMD="$CMD --input $INPUT"
-CMD="$CMD --output $OUTPUT"
 CMD="$CMD --workers $WORKERS"
 CMD="$CMD --start $START"
 

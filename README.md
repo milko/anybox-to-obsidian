@@ -25,7 +25,7 @@ This is the main importer. It:
 - uses cookies when available for Medium content
 
 ### Shell script
-- `run_import.sh`
+- `run-turbo.sh`
 
 This is the convenience wrapper script for running the importer in chunks.
 
@@ -226,16 +226,16 @@ python3 anybox_to_obsidian_cookies.py --start 100 --limit 100 --workers 4 --skip
 
 ### Option 2: run the shell wrapper
 
-If your `run_import.sh` wrapper is configured the way we discussed, it should take:
+If your `run-turbo.sh` wrapper is configured the way we discussed, it should take:
 
 ```bash
-./run_import.sh START LIMIT WORKERS
+./run-turbo.sh START LIMIT WORKERS
 ```
 
 Example:
 
 ```bash
-./run_import.sh 0 100 4
+./run-turbo.sh 0 100 4
 ```
 
 This would process:
@@ -246,7 +246,7 @@ This would process:
 Another example:
 
 ```bash
-./run_import.sh 100 100 4
+./run-turbo.sh 100 100 4
 ```
 
 This would process the next batch of 100 items.
@@ -265,9 +265,9 @@ A practical workflow is:
 Example sequence:
 
 ```bash
-./run_import.sh 0 100 4
-./run_import.sh 100 100 4
-./run_import.sh 200 100 4
+./run-turbo.sh 0 100 4
+./run-turbo.sh 100 100 4
+./run-turbo.sh 200 100 4
 ```
 
 ### Worker recommendations
@@ -305,7 +305,7 @@ A typical working directory might look like this:
 ```text
 .
 ├── anybox_to_obsidian_cookies.py
-├── run_import.sh
+├── run-turbo.sh
 ├── medium.com_cookies.txt
 ├── AnyBoxExport.json
 └── staging/
@@ -369,7 +369,7 @@ Example:
 ```bash
 rm -rf staging
 mkdir staging
-./run_import.sh 0 100 4
+./run-turbo.sh 0 100 4
 ```
 
 ## Obsidian usage notes

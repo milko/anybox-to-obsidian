@@ -27,6 +27,17 @@ Frontmatter behavior
 	Tags are intentionally omitted from generated notes.
 	An LLM will be used to assign tags after import.
 
+Rejection logic
+---------------
+	Items are marked as Fallback (and written to the rejection CSV) when:
+	  - No URL is present
+	  - The HTTP response is not 200
+	  - The source is a direct PDF (pdf_source_requires_pdf_extraction)
+	  - Medium paywall preview is detected (medium_paywalled_preview)
+	  - Only an academic abstract/summary was extracted (summary_only_extraction)
+	  - No content could be extracted at all (no_content)
+	  - An exception occurred during fetching or extraction
+
 Dependencies
 ------------
 	pip install requests beautifulsoup4 trafilatura readability-lxml
@@ -118,6 +129,19 @@ IGNORE_TAGS = {
 	"form", "button", "input", "select", "option", "textarea",
 	"svg", "canvas",
 }
+
+# Academic domains where summary-only extraction is likely
+ACADEMIC_DOMAINS = (
+	"mdpi.com",
+	"sciencedirect.com",
+	"springer.com",
+	"nature.com",
+	"wiley.com",
+	"tandfonline.com",
+	"frontiersin.org",
+	"researchgate.net",
+	"doi.org",
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -333,7 +357,6 @@ def normalize_folder(folder_value):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 3 — URL AND DOMAIN HELPERS
-# (Tag helpers removed — tags are no longer used)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_medium_url(url):
@@ -343,6 +366,17 @@ def is_medium_url(url):
 	try:
 		host = urlparse(url).netloc.lower()
 		return host.endswith("medium.com")
+	except Exception:
+		return False
+
+
+def is_probable_pdf_url(url):
+	"""
+	Return True if the URL path appears to point directly to a PDF file.
+	Used as a secondary check alongside the HTTP Content-Type header.
+	"""
+	try:
+		return urlparse(url).path.lower().endswith(".pdf")
 	except Exception:
 		return False
 
@@ -471,7 +505,9 @@ def extract_author_published(soup):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — MEDIUM PAYWALL / PREVIEW DETECTION
+# SECTION 5 — CONTENT QUALITY CHECKS
+# These functions detect cases where extraction "succeeded" technically
+# but the result is not a full article worth keeping.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def looks_like_medium_preview(url, content):
@@ -496,6 +532,66 @@ def looks_like_medium_preview(url, content):
 	]
 
 	return any(m in text for m in markers) and len(re.findall(r"\w+", text)) < 700
+
+
+def looks_like_summary_only(content, url=""):
+	"""
+	Heuristic detector for academic abstract/summary-only extractions.
+
+	Some academic publisher pages (MDPI, Springer, ScienceDirect, etc.)
+	show only the abstract and metadata in their HTML, with the full paper
+	body locked behind a PDF download or a paywall. When the extractor
+	finds "some content" on these pages it marks the item as Success, but
+	the note only contains the abstract.
+
+	This function catches that case by checking:
+	  1. The URL belongs to a known academic domain, OR the text contains
+	     typical academic signals (abstract, keywords, DOI, citation).
+	  2. The extracted text is short (< 1200 words).
+	  3. The text contains the word "abstract".
+	  4. Fewer than 2 body-section markers are present (introduction,
+	     methods, results, discussion, conclusion, etc.).
+
+	The check is intentionally conservative to avoid false positives on
+	legitimate short articles.
+	"""
+	if not content:
+		return False
+
+	text = re.sub(r"\s+", " ", content).lower()
+	word_count = len(re.findall(r"\w+", text))
+	host = urlparse(url).netloc.lower() if url else ""
+
+	# Signal 1: academic domain or academic vocabulary
+	academic_signal = (
+		any(domain in host for domain in ACADEMIC_DOMAINS)
+		or " abstract " in f" {text} "
+		or " keywords " in f" {text} "
+		or " doi " in f" {text} "
+		or " citation " in f" {text} "
+	)
+
+	if not academic_signal:
+		return False
+
+	# Signal 2: body section markers that would appear in a full paper
+	body_markers = [
+		"introduction",
+		"materials and methods",
+		"methods",
+		"methodology",
+		"results",
+		"discussion",
+		"conclusion",
+	]
+	body_hits = sum(1 for marker in body_markers if marker in text)
+
+	# Reject if: short AND has abstract signal AND missing body sections
+	return (
+		word_count < 1200
+		and "abstract" in text
+		and body_hits < 2
+	)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -617,11 +713,17 @@ def fetch_and_extract(url):
 	  3. readability-lxml              (Mozilla Readability port)
 	  4. BeautifulSoup crude renderer  (last resort)
 
-	After extraction, Medium paywall previews are detected and rejected.
+	Rejection logic (in order):
+	  - HTTP status != 200            -> "HTTP <code>"
+	  - Content-Type is PDF           -> "pdf_source_requires_pdf_extraction"
+	  - URL path ends in .pdf         -> "pdf_source_requires_pdf_extraction"
+	  - No content extracted          -> "no_content"
+	  - Medium paywall preview        -> "medium_paywalled_preview"
+	  - Academic summary/abstract only-> "summary_only_extraction"
 
 	Returns:
 	  (content, status, meta)
-	  - content : Markdown string, or None if extraction failed
+	  - content : Markdown string, or None if extraction failed/rejected
 	  - status  : short label describing what happened
 	  - meta    : dict with keys author, published, lead_image
 	"""
@@ -633,11 +735,23 @@ def fetch_and_extract(url):
 		if resp.status_code != 200:
 			return None, f"HTTP {resp.status_code}", {}
 
+		content_type = resp.headers.get("Content-Type", "").lower()
+		final_url = resp.url
+
+		# Reject direct PDF sources — the script cannot extract PDF body text.
+		# These are logged as Fallback so you can handle them manually.
+		if (
+			"application/pdf" in content_type
+			or is_probable_pdf_url(url)
+			or is_probable_pdf_url(final_url)
+		):
+			return None, "pdf_source_requires_pdf_extraction", {}
+
 		html = sanitize_html(resp.text)
 		soup = BeautifulSoup(html, "html.parser")
 
 		# Extract metadata from the page regardless of content extraction result
-		lead_image = extract_lead_image(soup, resp.url)
+		lead_image = extract_lead_image(soup, final_url)
 		author, published = extract_author_published(soup)
 
 		meta = {
@@ -699,8 +813,12 @@ def fetch_and_extract(url):
 		best_status, best_md = candidates[0]
 
 		# Reject Medium paywall previews
-		if looks_like_medium_preview(url, best_md):
+		if looks_like_medium_preview(final_url, best_md):
 			return None, "medium_paywalled_preview", meta
+
+		# Reject academic abstract/summary-only extractions
+		if looks_like_summary_only(best_md, final_url):
+			return None, "summary_only_extraction", meta
 
 		return best_md, best_status, meta
 
